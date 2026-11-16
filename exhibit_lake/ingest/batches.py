@@ -5,6 +5,7 @@ import json
 import sqlite3
 import uuid
 
+from exhibit_lake.catalog.placements import Placements
 from exhibit_lake.catalog.registry import now, require_id
 from exhibit_lake.catalog.store import Store
 from exhibit_lake.errors import Conflict, InvalidInput, NotFound
@@ -14,6 +15,7 @@ from exhibit_lake.ingest.validation import canonical, digest, event
 class Batches:
     def __init__(self, store: Store):
         self.store = store
+        self.placements = Placements(store)
 
     def ingest(self, source_id: str, contract_id: str, request_key: str, rows: list[object]) -> dict:
         require_id(source_id, "source_id")
@@ -39,8 +41,6 @@ class Batches:
             contract = Store.one(conn, "SELECT * FROM contracts WHERE contract_id=? AND source_id=?", (contract_id, source_id))
             if not contract:
                 raise NotFound("contract not found for source")
-            venue = Store.one(conn, "SELECT * FROM venues WHERE venue_id=?", (source["venue_id"],))
-            exhibits = {x["exhibit_id"]: x for x in Store.many(conn, "SELECT * FROM exhibits WHERE venue_id=?", (source["venue_id"],))}
             batch_id = uuid.uuid4().hex
             conn.execute("INSERT INTO batches VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                          (batch_id, source_id, request_key, payload_hash, contract_id, "landing", now(), None, len(rows), 0, 0))
@@ -50,7 +50,7 @@ class Batches:
                 body = canonical(row)
                 row_hash = digest(row)
                 conn.execute("INSERT INTO raw_rows VALUES(?,?,?,?)", (batch_id, row_no, body, row_hash))
-                normalized, problem = event(row, contract, source, venue, exhibits)
+                normalized, problem = event(conn, self.placements, row, contract, source)
                 if normalized is not None:
                     existing = Store.one(conn, "SELECT payload_hash FROM accepted_events WHERE source_id=? AND event_id=?",
                                          (source_id, normalized["event_id"]))
@@ -58,15 +58,19 @@ class Batches:
                         problem = {"code": "duplicate_event" if existing["payload_hash"] == row_hash else "event_conflict",
                                    "detail": "event identity was already accepted"}
                     else:
-                        conn.execute("INSERT INTO accepted_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        conn.execute("INSERT INTO accepted_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                      (normalized["event_id"], source_id, batch_id, row_no, normalized["venue_id"],
-                                      normalized["exhibit_id"], normalized["event_at"], normalized["local_day"],
+                                      normalized["exhibit_id"], normalized["requested_exhibit_id"],
+                                      normalized["event_at"], normalized["local_day"],
                                       normalized["kind"], normalized["value_num"], normalized["category"],
                                       normalized["visitor_hash"], normalized["payload_hash"], None))
                         valid += 1
                 if problem is not None:
+                    detail = problem["detail"]
+                    if len(problem) > 2:
+                        detail = json.dumps(problem, sort_keys=True, ensure_ascii=False)
                     conn.execute("INSERT INTO rejected_rows VALUES(?,?,?,?)",
-                                 (batch_id, row_no, problem["code"], problem["detail"]))
+                                 (batch_id, row_no, problem["code"], detail))
                     rejected += 1
             conn.execute("UPDATE batches SET status='committed',committed_at=?,valid_rows=?,rejected_rows=? WHERE batch_id=?",
                          (now(), valid, rejected, batch_id))
@@ -76,6 +80,13 @@ class Batches:
     def _report(self, conn: sqlite3.Connection, batch_id: str, *, replay: bool) -> dict:
         batch = Store.one(conn, "SELECT * FROM batches WHERE batch_id=?", (batch_id,))
         rejected = Store.many(conn, "SELECT row_no,code,detail FROM rejected_rows WHERE batch_id=? ORDER BY row_no", (batch_id,))
+        for row in rejected:
+            try:
+                parsed = json.loads(row["detail"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict) and parsed.get("code") == row["code"]:
+                row.update({key: value for key, value in parsed.items() if key != "code"})
         return {"batch_id": batch_id, "source_id": batch["source_id"], "request_key": batch["request_key"],
                 "status": batch["status"], "total_rows": batch["total_rows"], "valid_rows": batch["valid_rows"],
                 "rejected_rows": batch["rejected_rows"], "rejections": rejected, "replay": replay}

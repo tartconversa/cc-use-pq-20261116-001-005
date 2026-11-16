@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from exhibit_lake.errors import LakeError
+from exhibit_lake.errors import InvalidInput, LakeError
 from exhibit_lake.service import ExhibitLake
 
 
@@ -62,6 +62,30 @@ class WithdrawIn(BaseModel):
     withdrawn_on: str
 
 
+class MigrationIn(BaseModel):
+    migration_id: str
+    exhibit_id: str
+    to_venue_id: str
+    effective_on: str
+    request_key: str | None = None
+
+
+class RetractIn(BaseModel):
+    retracted_on: str
+
+
+class AliasIn(BaseModel):
+    alias_id: str
+    exhibit_id: str
+    effective_from: str | None = None
+    effective_to: str | None = None
+    request_key: str | None = None
+
+
+class AliasRetireIn(BaseModel):
+    retired_on: str
+
+
 def create_app(database: str | None = None) -> FastAPI:
     lake = ExhibitLake(database or os.environ.get("EXHIBIT_LAKE_DB", "exhibit_lake.db"))
     app = FastAPI(title="Exhibit Lake", version="1.0.0")
@@ -92,6 +116,52 @@ def create_app(database: str | None = None) -> FastAPI:
     @app.post("/exhibits/{exhibit_id}/withdraw")
     def withdraw(exhibit_id: str, data: WithdrawIn):
         return lake.registry.withdraw(exhibit_id, data.withdrawn_on)
+
+    @app.get("/exhibits/{exhibit_id}/placements")
+    def placements(exhibit_id: str):
+        return {"exhibit_id": exhibit_id, "placements": lake.placements.placements(exhibit_id)}
+
+    @app.get("/exhibits/{exhibit_id}/migrations")
+    def migrations(exhibit_id: str):
+        return {"exhibit_id": exhibit_id, "migrations": lake.placements.migrations(exhibit_id)}
+
+    @app.get("/exhibits/{exhibit_id}/conflicts")
+    def exhibit_conflicts(exhibit_id: str):
+        return lake.placements.conflicts(exhibit_id)
+
+    @app.get("/exhibits/{exhibit_id}/resolve")
+    def exhibit_resolution(exhibit_id: str, event_at: str):
+        return lake.resolve_exhibit(exhibit_id, event_at)
+
+    @app.get("/exhibits/{exhibit_id}/aliases")
+    def exhibit_aliases(exhibit_id: str):
+        return {"exhibit_id": exhibit_id, "aliases": lake.placements.aliases(exhibit_id)}
+
+    @app.post("/exhibits/{exhibit_id}/aliases", status_code=201)
+    def register_alias(exhibit_id: str, data: AliasIn):
+        if data.exhibit_id != exhibit_id:
+            raise InvalidInput("path and body exhibit_id differ")
+        return lake.register_exhibit_alias(data.alias_id, exhibit_id, data.effective_from,
+                                           data.effective_to, data.request_key)
+
+    @app.post("/exhibit-aliases/{alias_id}/retire")
+    def retire_alias(alias_id: str, data: AliasRetireIn):
+        return lake.retire_exhibit_alias(alias_id, data.retired_on)
+
+    @app.post("/exhibits/{exhibit_id}/migrations", status_code=201)
+    def migrate_exhibit(exhibit_id: str, data: MigrationIn):
+        if data.exhibit_id != exhibit_id:
+            raise InvalidInput("path and body exhibit_id differ")
+        return lake.migrate_exhibit(data.migration_id, exhibit_id, data.to_venue_id,
+                                    data.effective_on, data.request_key)
+
+    @app.get("/migrations")
+    def all_migrations():
+        return {"migrations": lake.placements.migrations()}
+
+    @app.post("/migrations/{migration_id}/retract")
+    def retract_migration(migration_id: str, data: RetractIn):
+        return lake.retract_migration(migration_id, data.retracted_on)
 
     @app.post("/sources", status_code=201)
     def source(data: SourceIn):

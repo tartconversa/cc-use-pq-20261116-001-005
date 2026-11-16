@@ -5,11 +5,13 @@ import json
 import sqlite3
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from zoneinfo import ZoneInfo
 
+from exhibit_lake.catalog.placements import Placements
 from exhibit_lake.catalog.registry import iso_day, now
 from exhibit_lake.catalog.store import Store
-from exhibit_lake.errors import Conflict, IntegrityFailure, InvalidInput, NotFound, StateError
+from exhibit_lake.catalog.timeutil import local_day
+from exhibit_lake.errors import Conflict, IntegrityFailure, NotFound, StateError
 from exhibit_lake.ingest.validation import digest
 
 
@@ -33,6 +35,7 @@ def _statistics(events: list[dict]) -> dict:
 class Snapshots:
     def __init__(self, store: Store):
         self.store = store
+        self.placements = Placements(store)
 
     def _partition(self, conn: sqlite3.Connection, venue_id: str, day: str) -> dict:
         part = Store.one(conn, "SELECT * FROM partitions WHERE venue_id=? AND local_day=?", (venue_id, day))
@@ -61,6 +64,7 @@ class Snapshots:
                 raise Conflict("expected head differs from current partition", details={"head_id": part["head_id"]})
             events = Store.many(conn, "SELECT source_id,event_id,exhibit_id,event_at,local_day,kind,value_num,category,visitor_hash,payload_hash "
                                "FROM accepted_events WHERE venue_id=? AND local_day=? ORDER BY source_id,event_id", (venue_id, day))
+            self._assert_partition_consistent(conn, venue_id, day, events)
             membership = [{"source_id": x["source_id"], "event_id": x["event_id"], "payload_hash": x["payload_hash"]}
                           for x in events]
             manifest = {"venue_id": venue_id, "local_day": day, "generation": part["generation"] + 1,
@@ -79,6 +83,29 @@ class Snapshots:
             Store.audit(conn, "snapshot.staged", snapshot_id,
                         {"venue_id": venue_id, "local_day": day, "members": len(membership)}, now())
             return self._describe(conn, snapshot_id)
+
+    def _assert_partition_consistent(self, conn, venue_id: str, day: str, events: list[dict]) -> None:
+        """发布前复核：每条事件按其时刻仍应归属本馆本日，且来源属于本馆。
+
+        迁移或撤回后遗留的错位事件不能悄悄进入快照，必须显式重放或重新归属。
+        """
+        mismatched = []
+        for event in events:
+            placement = self.placements.covering(conn, event["exhibit_id"], event["event_at"])
+            venue = Store.one(conn, "SELECT venue_id FROM sources WHERE source_id=?", (event["source_id"],))
+            if (not placement or placement["venue_id"] != venue_id
+                    or event["local_day"] != self._local_day(conn, venue_id, event["event_at"])
+                    or not venue or venue["venue_id"] != venue_id):
+                mismatched.append({"source_id": event["source_id"], "event_id": event["event_id"]})
+        if mismatched:
+            raise Conflict("partition contains events that no longer belong to this venue/day",
+                           details={"venue_id": venue_id, "local_day": day, "events": mismatched[:20],
+                                    "event_count": len(mismatched)})
+
+    @staticmethod
+    def _local_day(conn, venue_id: str, instant: str) -> str:
+        venue = Store.one(conn, "SELECT timezone FROM venues WHERE venue_id=?", (venue_id,))
+        return local_day(instant, ZoneInfo(venue["timezone"])) if venue else None
 
     def _describe(self, conn: sqlite3.Connection, snapshot_id: str) -> dict:
         snapshot = Store.one(conn, "SELECT * FROM snapshots WHERE snapshot_id=?", (snapshot_id,))

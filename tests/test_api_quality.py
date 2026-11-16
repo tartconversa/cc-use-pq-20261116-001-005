@@ -152,3 +152,92 @@ class ApiQualityTests(unittest.TestCase):
         self.ingest()
         self.publish()
         self.assertTrue(self.client.get("/venues/venue/integrity").json()["valid"])
+
+
+class ApiMigrationTests(unittest.TestCase):
+    """通过 HTTP 契约验证生效日迁移与身份映射。"""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.client = TestClient(create_app(str(Path(self.folder.name) / "api.db")))
+        for venue_id, timezone in [("showroom", "Asia/Shanghai"), ("museum", "America/New_York")]:
+            self.assertEqual(self.client.post("/venues", json={
+                "venue_id": venue_id, "name": venue_id, "timezone": timezone}).status_code, 201)
+        self.assertEqual(self.client.post("/exhibits", json={
+            "exhibit_id": "robot", "venue_id": "showroom", "name": "Robot",
+            "maker": "Maker", "launched_on": "2026-01-01"}).status_code, 201)
+        for source, venue in [("show-visits", "showroom"), ("museum-visits", "museum")]:
+            self.client.post("/sources", json={"source_id": source, "venue_id": venue, "kind": "visit"})
+            self.client.post("/contracts", json={"contract_id": source + "-v1", "source_id": source,
+                                                 "fields": ["event_id", "exhibit_id", "event_at", "count"],
+                                                 "effective_from": "2026-01-01T00:00:00+00:00"})
+
+    def migrate(self, **overrides):
+        payload = {"migration_id": "m1", "exhibit_id": "robot", "to_venue_id": "museum",
+                   "effective_on": "2026-03-10", "request_key": "migration-1"}
+        payload.update(overrides)
+        return self.client.post("/exhibits/robot/migrations", json=payload)
+
+    def test_migration_lifecycle(self):
+        created = self.migrate()
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(created.json()["from_venue_id"], "showroom")
+        self.assertEqual(created.json()["to_venue_id"], "museum")
+        replay = self.migrate()
+        self.assertTrue(replay.json()["replay"])
+        placements = self.client.get("/exhibits/robot/placements").json()["placements"]
+        self.assertEqual(len(placements), 2)
+        self.assertEqual(self.client.get("/exhibits/robot/conflicts").json()["conflict_count"], 0)
+        retracted = self.client.post("/migrations/m1/retract", json={"retracted_on": "2026-03-15"})
+        self.assertEqual(retracted.status_code, 200, retracted.text)
+        self.assertEqual(retracted.json()["status"], "retracted")
+        self.assertEqual(self.client.post("/migrations/m1/retract",
+                                          json={"retracted_on": "2026-03-16"}).status_code, 409)
+
+    def test_migration_conflicts_have_error_envelope(self):
+        self.migrate()
+        conflict = self.migrate(migration_id="m2", request_key="another")
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["error"]["code"], "conflict")
+        self.assertIn("chronological", conflict.json()["error"]["message"])
+        self.assertEqual(self.client.get("/exhibits/robot/placements").json()["placements"][1]["venue_id"],
+                         "museum")
+
+    def test_alias_round_trip(self):
+        self.migrate()
+        registered = self.client.post("/exhibits/robot/aliases", json={
+            "alias_id": "R-001", "exhibit_id": "robot", "effective_from": "2026-03-10"})
+        self.assertEqual(registered.status_code, 201, registered.text)
+        resolved = self.client.get("/exhibits/R-001/resolve",
+                                   params={"event_at": "2026-03-12T12:00:00-04:00"}).json()
+        self.assertEqual(resolved["exhibit_id"], "robot")
+        self.assertEqual(resolved["venue_id"], "museum")
+        self.assertTrue(resolved["alias"])
+        retired = self.client.post("/exhibit-aliases/R-001/retire", json={"retired_on": "2026-03-20"})
+        self.assertEqual(retired.status_code, 200)
+        self.assertEqual(retired.json()["effective_to"], "2026-03-19")
+
+    def test_ingest_after_migration_uses_new_venue_partition(self):
+        self.migrate()
+        accepted = self.client.post("/batches", json={
+            "source_id": "museum-visits", "contract_id": "museum-visits-v1", "request_key": "ny",
+            "events": [{"event_id": "e1", "exhibit_id": "robot",
+                        "event_at": "2026-03-11T23:00:00-04:00", "count": 4}]})
+        self.assertEqual(accepted.json()["valid_rows"], 1)
+        inventory = self.client.get("/partitions/museum/2026-03-11").json()["inventory"]
+        self.assertEqual(inventory["sources"][0]["events"], 1)
+        stale = self.client.post("/batches", json={
+            "source_id": "show-visits", "contract_id": "show-visits-v1", "request_key": "old",
+            "events": [{"event_id": "e2", "exhibit_id": "robot",
+                        "event_at": "2026-03-11T23:00:00+08:00", "count": 4}]})
+        self.assertEqual(stale.json()["rejections"][0]["code"], "outside_source_venue")
+
+    def test_migration_listing_and_resolve_before_placement(self):
+        self.assertEqual(self.client.get("/migrations").json()["migrations"], [])
+        self.migrate()
+        self.assertEqual(len(self.client.get("/migrations").json()["migrations"]), 1)
+        before = self.client.get("/exhibits/robot/resolve",
+                                 params={"event_at": "2026-02-01T12:00:00+08:00"}).json()
+        self.assertEqual(before["venue_id"], "showroom")
+        self.assertEqual(self.client.get("/exhibits/robot/migrations").json()["migrations"][0]["status"], "active")

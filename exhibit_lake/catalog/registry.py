@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from exhibit_lake.catalog.common import iso_day, iso_time, now, require_id
+from exhibit_lake.catalog.placements import Placements
 from exhibit_lake.catalog.store import Store
+from exhibit_lake.catalog.timeutil import day_start_utc, next_day
 from exhibit_lake.errors import Conflict, InvalidInput, NotFound
 
 
@@ -19,39 +21,13 @@ OPTIONAL = {"visit": {"channel"}, "feedback": {"comment", "channel"},
             "demo": {"host_id", "channel"}}
 
 
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def require_id(value: str, label: str) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= 80 or not all(
-            ch.isalnum() or ch in "_-:." for ch in value):
-        raise InvalidInput(f"{label} must be a nonempty identifier of at most 80 characters")
-    return value
-
-
-def iso_day(value: str, label: str) -> str:
-    try:
-        if not isinstance(value, str) or date.fromisoformat(value).isoformat() != value:
-            raise ValueError()
-    except ValueError:
-        raise InvalidInput(f"{label} must be an ISO date") from None
-    return value
-
-
-def iso_time(value: str, label: str) -> str:
-    try:
-        parsed = datetime.fromisoformat(value)
-        if parsed.utcoffset() is None:
-            raise ValueError()
-    except (TypeError, ValueError):
-        raise InvalidInput(f"{label} must be an offset-aware ISO timestamp") from None
-    return parsed.astimezone(timezone.utc).isoformat()
+__all__ = ["KINDS", "REQUIRED", "OPTIONAL", "Registry", "iso_day", "iso_time", "now", "require_id"]
 
 
 class Registry:
     def __init__(self, store: Store):
         self.store = store
+        self.placements = Placements(store)
 
     def venue(self, venue_id: str, name: str, timezone_name: str) -> dict:
         require_id(venue_id, "venue_id")
@@ -73,19 +49,27 @@ class Registry:
         require_id(exhibit_id, "exhibit_id")
         require_id(venue_id, "venue_id")
         iso_day(launched_on, "launched_on")
-        if withdrawn_on and iso_day(withdrawn_on, "withdrawn_on") < launched_on:
-            raise InvalidInput("withdrawal precedes launch")
+        if withdrawn_on:
+            iso_day(withdrawn_on, "withdrawn_on")
+            if withdrawn_on < launched_on:
+                raise InvalidInput("withdrawal precedes launch")
         if not all(isinstance(x, str) and x.strip() for x in (name, maker)):
             raise InvalidInput("exhibit name and maker are required")
         with self.store.transaction() as conn:
-            if not Store.one(conn, "SELECT venue_id FROM venues WHERE venue_id=?", (venue_id,)):
+            venue = Store.one(conn, "SELECT * FROM venues WHERE venue_id=?", (venue_id,))
+            if not venue:
                 raise NotFound("venue not found")
             if Store.one(conn, "SELECT exhibit_id FROM exhibits WHERE exhibit_id=?", (exhibit_id,)):
                 raise Conflict("exhibit already exists")
             conn.execute("INSERT INTO exhibits VALUES(?,?,?,?,?,?,?)",
                          (exhibit_id, venue_id, name.strip(), maker.strip(), launched_on, withdrawn_on, now()))
-            Store.audit(conn, "exhibit.created", exhibit_id, {"venue_id": venue_id}, now())
-        return {"exhibit_id": exhibit_id, "venue_id": venue_id, "launched_on": launched_on}
+            start = day_start_utc(launched_on, venue["timezone"])
+            end = day_start_utc(next_day(withdrawn_on), venue["timezone"]) if withdrawn_on else None
+            placement = self.placements.open_placement(conn, exhibit_id, venue_id, start, end)
+            Store.audit(conn, "exhibit.created", exhibit_id, {"venue_id": venue_id,
+                                                             "placement_id": placement["placement_id"]}, now())
+        return {"exhibit_id": exhibit_id, "venue_id": venue_id, "launched_on": launched_on,
+                "placement_id": placement["placement_id"]}
 
     def withdraw(self, exhibit_id: str, day: str) -> dict:
         iso_day(day, "withdrawn_on")
@@ -97,8 +81,15 @@ class Registry:
                 raise InvalidInput("withdrawal precedes launch")
             if exhibit["withdrawn_on"] is not None:
                 raise Conflict("exhibit already withdrawn")
+            current = self.placements.current_placement(conn, exhibit_id)
+            timezone_name = current["timezone"] if current else Store.one(
+                conn, "SELECT timezone FROM venues WHERE venue_id=?", (exhibit["venue_id"],))["timezone"]
+            cutover = day_start_utc(next_day(day), timezone_name)
+            # 撤展只截断仍在进行的驻留；已发布快照不被改写。
+            closed = self.placements.close_from(conn, exhibit_id, cutover)
             conn.execute("UPDATE exhibits SET withdrawn_on=? WHERE exhibit_id=?", (day, exhibit_id))
-            Store.audit(conn, "exhibit.withdrawn", exhibit_id, {"day": day}, now())
+            Store.audit(conn, "exhibit.withdrawn", exhibit_id,
+                        {"day": day, "closed_placements": closed}, now())
         return {"exhibit_id": exhibit_id, "withdrawn_on": day}
 
     def source(self, source_id: str, venue_id: str, kind: str) -> dict:

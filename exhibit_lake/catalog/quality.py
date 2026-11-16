@@ -5,6 +5,7 @@ import json
 
 from exhibit_lake.catalog.registry import iso_day
 from exhibit_lake.catalog.store import Store
+from exhibit_lake.catalog.timeutil import day_start_utc, next_day
 from exhibit_lake.errors import NotFound
 
 
@@ -41,11 +42,23 @@ class Quality:
     def partition(self, venue_id: str, day: str) -> dict:
         iso_day(day, "local_day")
         with self.store.transaction(write=False) as conn:
-            if not Store.one(conn, "SELECT venue_id FROM venues WHERE venue_id=?", (venue_id,)):
+            venue = Store.one(conn, "SELECT * FROM venues WHERE venue_id=?", (venue_id,))
+            if not venue:
                 raise NotFound("venue not found")
-            exhibits = Store.many(conn, "SELECT exhibit_id,name,launched_on,withdrawn_on FROM exhibits "
-                                  "WHERE venue_id=? ORDER BY exhibit_id", (venue_id,))
-            available = [x for x in exhibits if x["launched_on"] <= day and (not x["withdrawn_on"] or day <= x["withdrawn_on"])]
+            start, end = day_start_utc(day, venue["timezone"]), day_start_utc(next_day(day), venue["timezone"])
+            exhibits = Store.many(conn, "SELECT DISTINCT e.exhibit_id,e.name,e.launched_on,e.withdrawn_on "
+                                  "FROM exhibits e JOIN exhibit_placements p ON p.exhibit_id=e.exhibit_id "
+                                  "WHERE p.venue_id=? AND p.effective_from<? "
+                                  "AND (p.effective_to IS NULL OR p.effective_to>?) ORDER BY e.exhibit_id",
+                                  (venue_id, end, start))
+            migrated_in = Store.many(conn, "SELECT exhibit_id,migration_id,effective_on,from_venue_id,to_venue_id "
+                                    "FROM exhibit_migrations WHERE to_venue_id=? AND status='active' "
+                                    "AND cutover_at>=? AND cutover_at<? ORDER BY cutover_at",
+                              (venue_id, start, end))
+            migrated_out = Store.many(conn, "SELECT exhibit_id,migration_id,effective_on,from_venue_id,to_venue_id "
+                                     "FROM exhibit_migrations WHERE from_venue_id=? AND status='active' "
+                                     "AND cutover_at>=? AND cutover_at<? ORDER BY cutover_at",
+                               (venue_id, start, end))
             source_rows = Store.many(conn, "SELECT s.source_id,s.kind,s.active,COUNT(c.contract_id) AS contracts "
                                      "FROM sources s LEFT JOIN contracts c ON c.source_id=s.source_id "
                                      "WHERE s.venue_id=? GROUP BY s.source_id,s.kind,s.active ORDER BY s.source_id", (venue_id,))
@@ -54,6 +67,7 @@ class Quality:
             rejected = Store.many(conn, "SELECT r.code,COUNT(*) AS n FROM rejected_rows r JOIN batches b ON b.batch_id=r.batch_id "
                                   "JOIN sources s ON s.source_id=b.source_id WHERE s.venue_id=? AND substr(b.received_at,1,10)=? "
                                   "GROUP BY r.code ORDER BY r.code", (venue_id, day))
-            return {"venue_id": venue_id, "local_day": day, "exhibits_available": len(available),
-                    "available_exhibit_ids": [x["exhibit_id"] for x in available],
+            return {"venue_id": venue_id, "local_day": day, "exhibits_available": len(exhibits),
+                    "available_exhibit_ids": [x["exhibit_id"] for x in exhibits],
+                    "migrated_in": migrated_in, "migrated_out": migrated_out,
                     "pending_events": pending, "sources": source_rows, "rejected_by_receive_day": rejected}

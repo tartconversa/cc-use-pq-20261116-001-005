@@ -19,13 +19,17 @@ class Experience:
                 snapshot_id: str | None = None) -> dict:
         iso_day(day, "local_day")
         with self.store.transaction(write=False) as conn:
-            exhibit = Store.one(conn, "SELECT * FROM exhibits WHERE exhibit_id=? AND venue_id=?",
-                                (exhibit_id, venue_id))
-            if not exhibit:
-                raise NotFound("exhibit not found at venue")
+            identity = self.analytics.snapshots.placements.identity_on_local_day(conn, exhibit_id, venue_id, day)
+            if not identity:
+                raise NotFound("exhibit not found")
+            canonical = identity["exhibit_id"]
+            report = Store.one(conn, "SELECT name,maker FROM exhibits WHERE exhibit_id=?", (canonical,))
             snapshot = self.analytics._resolve(conn, venue_id, day, snapshot_id)
-            events = [x for x in self.analytics._records(conn, snapshot["snapshot_id"])
-                      if x["exhibit_id"] == exhibit_id]
+            placed = self.analytics.snapshots.placements.venue_on_local_day(conn, canonical, venue_id, day)
+            records = self.analytics._records(conn, snapshot["snapshot_id"])
+            events = [x for x in records if x["exhibit_id"] == canonical]
+            if not events and not placed:
+                raise NotFound("exhibit not found at venue")
             visits = [x for x in events if x["kind"] == "visit"]
             feedback = [x for x in events if x["kind"] == "feedback"]
             demos = [x for x in events if x["kind"] == "demo"]
@@ -50,7 +54,8 @@ class Experience:
                                  "rating_average": round(sum(group["ratings"]) / len(group["ratings"]), 4)
                                  if group["ratings"] else None})
             return {"venue_id": venue_id, "local_day": day, "snapshot_id": snapshot["snapshot_id"],
-                    "exhibit_id": exhibit_id, "exhibit_name": exhibit["name"],
+                    "exhibit_id": canonical, "requested_exhibit_id": exhibit_id,
+                    "exhibit_name": report["name"],
                     "visitors": visitor_total, "visit_events": len(visits),
                     "feedback": len(feedback), "unique_feedback_visitors": len({x["visitor_hash"] for x in feedback}),
                     "rating_histogram": rating_buckets,

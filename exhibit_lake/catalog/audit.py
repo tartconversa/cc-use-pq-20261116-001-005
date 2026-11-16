@@ -77,7 +77,34 @@ class Audit:
                     issues.append({"local_day": part["local_day"], "code": "orphan_generation"})
             batches = Store.many(conn, "SELECT b.batch_id FROM batches b JOIN sources s ON s.source_id=b.source_id "
                                  "WHERE s.venue_id=? ORDER BY b.batch_id", (venue_id,))
+            migration_issues = self._migration_issues(conn, venue_id)
         damaged = [self.batch_integrity(x["batch_id"]) for x in batches]
         issues.extend({"batch_id": x["batch_id"], "code": "batch_integrity"} for x in damaged if not x["valid"])
+        issues.extend(migration_issues)
         return {"venue_id": venue_id, "valid": not issues, "partitions": len(parts),
                 "batches": len(batches), "issues": issues}
+
+    @staticmethod
+    def _migration_issues(conn, venue_id: str) -> list[dict]:
+        """检查与该场馆相关的迁移区间是否重叠、事件是否仍指向错误场馆。"""
+        issues = []
+        migrations = Store.many(conn, "SELECT * FROM exhibit_migrations WHERE from_venue_id=? OR to_venue_id=?",
+                                (venue_id, venue_id))
+        for migration in migrations:
+            placements = Store.many(conn, "SELECT * FROM exhibit_placements WHERE exhibit_id=? "
+                                          "ORDER BY effective_from", (migration["exhibit_id"],))
+            for left, right in zip(placements, placements[1:]):
+                if left["effective_to"] is not None and left["effective_to"] <= left["effective_from"]:
+                    continue
+                if left["effective_to"] is None or left["effective_to"] > right["effective_from"]:
+                    issues.append({"migration_id": migration["migration_id"], "code": "overlapping_placements",
+                                   "exhibit_id": migration["exhibit_id"],
+                                   "placement_ids": [left["placement_id"], right["placement_id"]]})
+            if migration["status"] != "active":
+                stray = Store.one(conn, "SELECT COUNT(*) AS n FROM accepted_events WHERE exhibit_id=? AND venue_id=? "
+                                        "AND event_at>=? AND published_at IS NULL",
+                                  (migration["exhibit_id"], migration["to_venue_id"], migration["cutover_at"]))["n"]
+                if stray:
+                    issues.append({"migration_id": migration["migration_id"], "code": "retracted_migration_pending",
+                                   "exhibit_id": migration["exhibit_id"], "pending_events": stray})
+        return issues

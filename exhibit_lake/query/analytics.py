@@ -46,7 +46,6 @@ class Analytics:
         with self.store.transaction(write=False) as conn:
             snapshot = self._resolve(conn, venue_id, day, snapshot_id)
             records = self._records(conn, snapshot["snapshot_id"])
-            exhibits = {x["exhibit_id"]: x for x in Store.many(conn, "SELECT exhibit_id,name,maker,launched_on,withdrawn_on FROM exhibits WHERE venue_id=?", (venue_id,))}
             groups = defaultdict(lambda: {"visit_events": 0, "visitors": 0, "feedback_events": 0,
                                           "rating_sum": 0, "rating_average": None, "demo_events": 0,
                                           "demo_seconds": 0.0, "feedback_visitors": set(), "channels": defaultdict(int)})
@@ -64,12 +63,17 @@ class Analytics:
                     group["demo_seconds"] += record["value_num"]
                 if record["category"]:
                     group["channels"][record["category"]] += 1
+            # 已迁移展品的名称/制造商仍取自全局展品登记，不随场馆变化而缺失。
+            catalog = {x["exhibit_id"]: x for x in Store.many(
+                conn, "SELECT exhibit_id,name,maker,launched_on,withdrawn_on FROM exhibits "
+                      "WHERE exhibit_id IN (%s)" % ",".join("?" * len(groups)), tuple(sorted(groups)))} if groups else {}
             result = []
             for exhibit_id in sorted(groups):
                 group = groups[exhibit_id]
                 feedback = group["feedback_events"]
-                result.append({"exhibit_id": exhibit_id, "name": exhibits[exhibit_id]["name"],
-                               "maker": exhibits[exhibit_id]["maker"], "visit_events": group["visit_events"],
+                exhibit = catalog.get(exhibit_id, {"name": exhibit_id, "maker": None})
+                result.append({"exhibit_id": exhibit_id, "name": exhibit["name"],
+                               "maker": exhibit["maker"], "visit_events": group["visit_events"],
                                "visitors": group["visitors"], "feedback_events": feedback,
                                "unique_feedback_visitors": len(group["feedback_visitors"]),
                                "rating_average": round(group["rating_sum"] / feedback, 4) if feedback else None,

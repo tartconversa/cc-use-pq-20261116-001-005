@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from exhibit_lake.catalog.registry import Registry
+from exhibit_lake.catalog.placements import Placements
 from exhibit_lake.catalog.store import Store
 from exhibit_lake.catalog.audit import Audit
 from exhibit_lake.catalog.quality import Quality
@@ -23,6 +24,7 @@ from exhibit_lake.query.batch_quality import BatchQuality
 class ExhibitLake:
     def __init__(self, database: str | Path):
         self.store = Store(database)
+        self.placements = Placements(self.store)
         self.registry = Registry(self.store)
         self.batches = Batches(self.store)
         self.preview = Preview(self.store)
@@ -51,6 +53,27 @@ class ExhibitLake:
     def register_contract(self, contract_id: str, source_id: str, fields: list[str],
                           effective_from: str, effective_to: str | None = None) -> dict:
         return self.registry.contract(contract_id, source_id, fields, effective_from, effective_to)
+
+    # ---- 场馆迁移与展品身份映射 ----
+
+    def migrate_exhibit(self, migration_id: str, exhibit_id: str, to_venue_id: str,
+                        effective_on: str, request_key: str | None = None) -> dict:
+        return self.placements.migrate(migration_id, exhibit_id, to_venue_id, effective_on, request_key)
+
+    def retract_migration(self, migration_id: str, day: str) -> dict:
+        return self.placements.retract_migration(migration_id, day)
+
+    def register_exhibit_alias(self, alias_id: str, exhibit_id: str,
+                               effective_from: str | None = None,
+                               effective_to: str | None = None,
+                               request_key: str | None = None) -> dict:
+        return self.placements.register_alias(alias_id, exhibit_id, effective_from, effective_to, request_key)
+
+    def retire_exhibit_alias(self, alias_id: str, day: str) -> dict:
+        return self.placements.retire_alias(alias_id, day)
+
+    def resolve_exhibit(self, exhibit_id: str, event_at: str) -> dict:
+        return self.placements.resolve(exhibit_id, event_at)
 
     def ingest(self, source_id: str, contract_id: str, request_key: str, events: list[object]) -> dict:
         return self.batches.ingest(source_id, contract_id, request_key, events)

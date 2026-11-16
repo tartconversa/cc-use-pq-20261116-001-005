@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from exhibit_lake.catalog.placements import Placements
 from exhibit_lake.catalog.registry import require_id
 from exhibit_lake.catalog.store import Store
 from exhibit_lake.errors import Conflict, InvalidInput, NotFound
@@ -12,6 +13,7 @@ from exhibit_lake.ingest.validation import digest, event
 class Preview:
     def __init__(self, store: Store):
         self.store = store
+        self.placements = Placements(store)
 
     def inspect(self, source_id: str, contract_id: str, rows: list[object]) -> dict:
         require_id(source_id, "source_id")
@@ -31,13 +33,11 @@ class Preview:
             contract = Store.one(conn, "SELECT * FROM contracts WHERE contract_id=? AND source_id=?", (contract_id, source_id))
             if not contract:
                 raise NotFound("contract not found for source")
-            venue = Store.one(conn, "SELECT * FROM venues WHERE venue_id=?", (source["venue_id"],))
-            exhibits = {x["exhibit_id"]: x for x in Store.many(conn, "SELECT * FROM exhibits WHERE venue_id=?", (source["venue_id"],))}
             seen = {}
             outcomes = []
             partitions = Counter()
             for row_no, row in enumerate(rows, 1):
-                normalized, problem = event(row, contract, source, venue, exhibits)
+                normalized, problem = event(conn, self.placements, row, contract, source)
                 if normalized:
                     identity = normalized["event_id"]
                     if identity in seen:
@@ -54,7 +54,9 @@ class Preview:
                 else:
                     partitions[normalized["local_day"]] += 1
                     outcomes.append({"row_no": row_no, "accepted": True, "event_id": normalized["event_id"],
-                                     "local_day": normalized["local_day"], "exhibit_id": normalized["exhibit_id"]})
+                                     "local_day": normalized["local_day"], "venue_id": normalized["venue_id"],
+                                     "exhibit_id": normalized["exhibit_id"],
+                                     "requested_exhibit_id": normalized["requested_exhibit_id"]})
         return {"source_id": source_id, "contract_id": contract_id, "payload_hash": batch_hash,
                 "total_rows": len(rows), "would_accept": sum(x["accepted"] for x in outcomes),
                 "would_reject": sum(not x["accepted"] for x in outcomes),
